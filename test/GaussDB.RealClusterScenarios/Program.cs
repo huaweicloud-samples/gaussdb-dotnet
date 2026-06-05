@@ -3334,7 +3334,7 @@ static async Task CommandTimeoutNoReplayAsync(Options options)
 static async Task SeedBindingRebindScenarioAsync(Options options, bool usingEip)
 {
     // 基础 rebind 场景：
-    // dynamic endpoint 可用时优先用 dynamic；失效后回退 seed；恢复后再切回 dynamic。
+    // dynamic endpoint 可用时优先用 dynamic；所有 dynamic 候选失效后回退 seed；恢复后再切回 dynamic。
     await ExecuteDynamicEndpointRebindAsync(options, usingEip, verifyRepeatedPostRecoveryOpen: false);
 }
 
@@ -3408,81 +3408,116 @@ static async Task ExecuteDynamicEndpointRebindAsync(Options options, bool usingE
 {
     // 这个辅助函数统一覆盖两类场景：
     // 1. UsingEip=true/false 时 dynamic endpoint 的首选列是否正确；
-    // 2. dynamic 失效 -> 回退 seed -> dynamic 恢复后的回切路径是否正确。
+    // 2. dynamic 候选整体失效 -> 回退 seed -> dynamic 恢复后的回切路径是否正确。
     var seedRoutes = await LoadSeedRoutesAsync(options);
     var seedRoute = seedRoutes[0];
     var coordinatorMetadata = await LoadCoordinatorMetadataByNodeNameAsync(options, seedRoute.Target);
-    var seedCoordinator = coordinatorMetadata[seedRoute.NodeName];
+    var seedRoutesByNodeName = seedRoutes.ToDictionary(static route => route.NodeName, StringComparer.Ordinal);
+    var dynamicProxies = new List<RealTcpFaultProxy>(coordinatorMetadata.Count);
+    var dynamicProxyEndpoints = new Dictionary<string, Endpoint>(StringComparer.Ordinal);
+    var rewrittenCoordinators = new List<CoordinatorMetadata>(coordinatorMetadata.Count);
 
-    await using var dynamicProxy = RealTcpFaultProxy.Start(seedRoute.SeedEndpoint.Host, seedRoute.SeedEndpoint.Port);
-    var dynamicEndpoint = ParseEndpoint(dynamicProxy.Endpoint);
-    var rewrittenCoordinator = usingEip
-        ? new CoordinatorMetadata(
-            seedRoute.NodeName,
-            seedCoordinator.HostEndpoint,
-            dynamicEndpoint,
-            seedCoordinator.HostEndpoint,
-            seedCoordinator.EipEndpoint)
-        : new CoordinatorMetadata(
-            seedRoute.NodeName,
-            dynamicEndpoint,
-            seedCoordinator.EipEndpoint,
-            seedCoordinator.HostEndpoint,
-            seedCoordinator.EipEndpoint);
-
-    await using var metadataProxy = PgMetadataRewriteProxy.Start(
-        seedRoute.SeedEndpoint.Host,
-        seedRoute.SeedEndpoint.Port,
-        new[] { rewrittenCoordinator });
-
-    var scenarioExtra =
-        $"AutoBalance=roundrobin;RefreshCNIpListTime={options.RefreshSecondsForScenario};HostRecheckSeconds=1;AutoReconnect=false;Application Name=seed-binding-rebind-{(usingEip ? "eip" : "inner")}-{Guid.NewGuid():N}";
-    var connectionString = ConnectionStringUtil.BuildConnectionString(
-        new[] { metadataProxy.Endpoint },
-        ApplyUsingEipToBaseExtra(options.BaseExtra, usingEip),
-        scenarioExtra);
-
-    Console.WriteLine($"ConnectionString={connectionString}");
-    Console.WriteLine($"metadata-proxy={metadataProxy.Endpoint} target={metadataProxy.Target}");
-    Console.WriteLine($"dynamic-endpoint={dynamicEndpoint} target-node={seedRoute.NodeName} using-eip={usingEip}");
-
-    await using var dataSource = new GaussDBDataSourceBuilder(connectionString).BuildMultiHost();
-
-    // step-1: dynamic endpoint 可达，第一次 Open 应优先命中 dynamic。
-    var step1 = await OpenObservationFromDataSourceAsync(dataSource, attempt: 1);
-    Console.WriteLine($"step-1 connected={step1.ConnectedEndpoint} node={step1.NodeName} server={step1.ServerEndpoint}");
-    Console.WriteLine($"step-1 metadata-proxy-rewritten-rows={metadataProxy.RewrittenRowCount}");
-    Console.WriteLine($"step-1 metadata-proxy-seen-sql={string.Join(" || ", metadataProxy.SeenSql)}");
-    if (step1.ConnectedEndpoint != dynamicEndpoint.ToString())
-        throw new InvalidOperationException($"Expected step-1 to prefer dynamic endpoint {dynamicEndpoint}, actual={step1.ConnectedEndpoint}.");
-
-    // step-2: 把 dynamic endpoint 暂停掉，等待刷新窗口过期后再次 Open，应回退到 seed。
-    await dynamicProxy.RejectConnectionsAsync();
-    Console.WriteLine($"step-2 paused dynamic endpoint={dynamicEndpoint}");
-    await Task.Delay(TimeSpan.FromSeconds(options.RefreshSecondsForScenario + 1));
-
-    var step2 = await OpenObservationFromDataSourceAsync(dataSource, attempt: 2);
-    Console.WriteLine($"step-2 connected={step2.ConnectedEndpoint} node={step2.NodeName} server={step2.ServerEndpoint}");
-    if (step2.ConnectedEndpoint != metadataProxy.Endpoint)
-        throw new InvalidOperationException($"Expected step-2 to fall back to metadata seed {metadataProxy.Endpoint}, actual={step2.ConnectedEndpoint}.");
-
-    // step-3: 恢复 dynamic endpoint，再等一个刷新窗口，新的 Open 应重新切回 dynamic。
-    await dynamicProxy.ResumeAsync();
-    Console.WriteLine($"step-3 resumed dynamic endpoint={dynamicEndpoint}");
-    await Task.Delay(TimeSpan.FromSeconds(options.RefreshSecondsForScenario + 1));
-
-    var step3 = await OpenObservationFromDataSourceAsync(dataSource, attempt: 3);
-    Console.WriteLine($"step-3 connected={step3.ConnectedEndpoint} node={step3.NodeName} server={step3.ServerEndpoint}");
-    if (step3.ConnectedEndpoint != dynamicEndpoint.ToString())
-        throw new InvalidOperationException($"Expected step-3 to switch back to dynamic endpoint {dynamicEndpoint}, actual={step3.ConnectedEndpoint}.");
-
-    if (verifyRepeatedPostRecoveryOpen)
+    try
     {
-        // step-4: 再补一次 Open，验证恢复后的命中结果不是偶发，而是可持续稳定复用。
-        var step4 = await OpenObservationFromDataSourceAsync(dataSource, attempt: 4);
-        Console.WriteLine($"step-4 connected={step4.ConnectedEndpoint} node={step4.NodeName} server={step4.ServerEndpoint}");
-        if (step4.ConnectedEndpoint != dynamicEndpoint.ToString())
-            throw new InvalidOperationException($"Expected step-4 to remain on recovered dynamic endpoint {dynamicEndpoint}, actual={step4.ConnectedEndpoint}.");
+        foreach (var coordinator in coordinatorMetadata.Values.OrderBy(static metadata => metadata.NodeName, StringComparer.Ordinal))
+        {
+            if (!seedRoutesByNodeName.TryGetValue(coordinator.NodeName, out var matchingSeedRoute))
+            {
+                throw new InvalidOperationException(
+                    $"Seed binding rebind scenario requires every discovered coordinator to be present in the seed hosts. missing-node={coordinator.NodeName}");
+            }
+
+            var proxy = RealTcpFaultProxy.Start(matchingSeedRoute.SeedEndpoint.Host, matchingSeedRoute.SeedEndpoint.Port);
+            dynamicProxies.Add(proxy);
+            var dynamicEndpoint = ParseEndpoint(proxy.Endpoint);
+            dynamicProxyEndpoints.Add(coordinator.NodeName, dynamicEndpoint);
+
+            rewrittenCoordinators.Add(usingEip
+                ? new CoordinatorMetadata(
+                    coordinator.NodeName,
+                    coordinator.HostEndpoint,
+                    dynamicEndpoint,
+                    coordinator.HostEndpoint,
+                    coordinator.EipEndpoint)
+                : new CoordinatorMetadata(
+                    coordinator.NodeName,
+                    dynamicEndpoint,
+                    coordinator.EipEndpoint,
+                    coordinator.HostEndpoint,
+                    coordinator.EipEndpoint));
+        }
+
+        await using var metadataProxy = PgMetadataRewriteProxy.Start(
+            seedRoute.SeedEndpoint.Host,
+            seedRoute.SeedEndpoint.Port,
+            rewrittenCoordinators);
+
+        var scenarioExtra =
+            $"AutoBalance=roundrobin;RefreshCNIpListTime={options.RefreshSecondsForScenario};HostRecheckSeconds=1;AutoReconnect=false;Application Name=seed-binding-rebind-{(usingEip ? "eip" : "inner")}-{Guid.NewGuid():N}";
+        var connectionString = ConnectionStringUtil.BuildConnectionString(
+            new[] { metadataProxy.Endpoint },
+            ApplyUsingEipToBaseExtra(options.BaseExtra, usingEip),
+            scenarioExtra);
+
+        Console.WriteLine($"ConnectionString={connectionString}");
+        Console.WriteLine($"metadata-proxy={metadataProxy.Endpoint} target={metadataProxy.Target}");
+        Console.WriteLine($"dynamic-endpoints={string.Join(",", dynamicProxyEndpoints.Select(static pair => $"{pair.Key}={pair.Value}"))} using-eip={usingEip}");
+
+        await using var dataSource = new GaussDBDataSourceBuilder(connectionString).BuildMultiHost();
+        var dynamicEndpointSet = dynamicProxyEndpoints.Values.Select(static endpoint => endpoint.ToString()).ToHashSet(StringComparer.Ordinal);
+
+        // step-1: dynamic endpoint 可达，第一次 Open 应优先命中任一 dynamic 候选。
+        var step1 = await OpenObservationFromDataSourceAsync(dataSource, attempt: 1);
+        Console.WriteLine($"step-1 connected={step1.ConnectedEndpoint} node={step1.NodeName} server={step1.ServerEndpoint}");
+        Console.WriteLine($"step-1 metadata-proxy-rewritten-rows={metadataProxy.RewrittenRowCount}");
+        Console.WriteLine($"step-1 metadata-proxy-seen-sql={string.Join(" || ", metadataProxy.SeenSql)}");
+        if (!dynamicEndpointSet.Contains(step1.ConnectedEndpoint))
+        {
+            throw new InvalidOperationException(
+                $"Expected step-1 to prefer one of the dynamic endpoints [{string.Join(",", dynamicEndpointSet)}], actual={step1.ConnectedEndpoint}.");
+        }
+
+        // step-2: 把所有 dynamic endpoint 暂停掉，等待刷新窗口过期后再次 Open，应回退到 seed。
+        foreach (var proxy in dynamicProxies)
+            await proxy.RejectConnectionsAsync();
+        Console.WriteLine($"step-2 paused dynamic endpoints={string.Join(",", dynamicEndpointSet)}");
+        await Task.Delay(TimeSpan.FromSeconds(options.RefreshSecondsForScenario + 1));
+
+        var step2 = await OpenObservationFromDataSourceAsync(dataSource, attempt: 2);
+        Console.WriteLine($"step-2 connected={step2.ConnectedEndpoint} node={step2.NodeName} server={step2.ServerEndpoint}");
+        if (step2.ConnectedEndpoint != metadataProxy.Endpoint)
+            throw new InvalidOperationException($"Expected step-2 to fall back to metadata seed {metadataProxy.Endpoint}, actual={step2.ConnectedEndpoint}.");
+
+        // step-3: 恢复 dynamic endpoint，再等一个刷新窗口，新的 Open 应重新切回 dynamic。
+        foreach (var proxy in dynamicProxies)
+            await proxy.ResumeAsync();
+        Console.WriteLine($"step-3 resumed dynamic endpoints={string.Join(",", dynamicEndpointSet)}");
+        await Task.Delay(TimeSpan.FromSeconds(options.RefreshSecondsForScenario + 1));
+
+        var step3 = await OpenObservationFromDataSourceAsync(dataSource, attempt: 3);
+        Console.WriteLine($"step-3 connected={step3.ConnectedEndpoint} node={step3.NodeName} server={step3.ServerEndpoint}");
+        if (!dynamicEndpointSet.Contains(step3.ConnectedEndpoint))
+        {
+            throw new InvalidOperationException(
+                $"Expected step-3 to switch back to one of the dynamic endpoints [{string.Join(",", dynamicEndpointSet)}], actual={step3.ConnectedEndpoint}.");
+        }
+
+        if (verifyRepeatedPostRecoveryOpen)
+        {
+            // step-4: 再补一次 Open，验证恢复后的命中结果不是偶发，而是可持续稳定复用。
+            var step4 = await OpenObservationFromDataSourceAsync(dataSource, attempt: 4);
+            Console.WriteLine($"step-4 connected={step4.ConnectedEndpoint} node={step4.NodeName} server={step4.ServerEndpoint}");
+            if (!dynamicEndpointSet.Contains(step4.ConnectedEndpoint))
+            {
+                throw new InvalidOperationException(
+                    $"Expected step-4 to remain on recovered dynamic endpoints [{string.Join(",", dynamicEndpointSet)}], actual={step4.ConnectedEndpoint}.");
+            }
+        }
+    }
+    finally
+    {
+        foreach (var proxy in dynamicProxies)
+            await proxy.DisposeAsync();
     }
 }
 
