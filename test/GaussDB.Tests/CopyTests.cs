@@ -1,4 +1,5 @@
 using System;
+using System.Buffers.Binary;
 using System.Collections;
 using System.Collections.Generic;
 using System.Collections.Specialized;
@@ -20,6 +21,9 @@ namespace HuaweiCloud.GaussDB.Tests;
 //todo: 当前测试用例中大量使用到COPY和Reader，适配GaussDB效果不好重构需要重点关注
 public class CopyTests(MultiplexingMode multiplexingMode) : MultiplexingTestBase(multiplexingMode)
 {
+    const int FileHasOidsFlag = 1 << 16;
+    const int FileHasEncodingFlag = 1 << 15;
+
     #region Issue 2257
 
     [Test, Description("Reproduce #2257")]
@@ -529,6 +533,168 @@ INSERT INTO {table} (field_text, field_int4) VALUES ('HELLO', 8)");
         Assert.Throws<PostgresException>(() => conn.BeginBinaryExport("COPY table_is_not_exist (blob) TO STDOUT BINARY"));
         Assert.That(conn.FullState, Is.EqualTo(ConnectionState.Open));
         Assert.That(await conn.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+    }
+
+    [Test]
+    // Protocol-level regression for GaussDB/openGauss binary COPY headers that set file_has_encoding.
+    // The 2-byte extension payload models the file encoding marker carried in the header extension;
+    // the exporter must consume it as opaque metadata and begin typed decoding at the first row field.
+    public async Task Exporter_skips_header_extension_and_reads_first_field_correctly()
+    {
+        await using var postmasterMock = PgPostmasterMock.Start(ConnectionString);
+        await using var dataSource = CreateDataSource(postmasterMock.ConnectionString);
+        await using var conn = await dataSource.OpenConnectionAsync();
+
+        var server = await postmasterMock.WaitForServerConnection();
+        const string copyCommand = "COPY (SELECT 1::int4) TO STDOUT BINARY";
+        var exportTask = conn.BeginBinaryExportAsync(copyCommand);
+
+        await server.ExpectSimpleQuery(copyCommand);
+        WriteCopyOutResponse(server, numColumns: 1);
+        WriteCopyData(server, BuildHeaderAndSingleRowPayload(
+            flags: FileHasEncodingFlag,
+            extensionPayload: [0, 7],
+            rowFields: [Int32ToBigEndianBytes(1)]));
+        WriteCopyData(server, BuildTrailerPayload());
+        WriteCopyDone(server);
+        server.WriteCommandComplete("COPY 1");
+        server.WriteReadyForQuery();
+        await server.FlushAsync();
+
+        await using var exporter = await exportTask;
+
+        Assert.That(exporter.StartRow(), Is.EqualTo(1));
+        Assert.That(exporter.Read<int>(), Is.EqualTo(1));
+        Assert.That(exporter.StartRow(), Is.EqualTo(-1));
+    }
+
+    [Test]
+    // Verifies row-boundary handling when the last row and the standard Int16 -1 binary trailer share
+    // a CopyData payload. The header also carries the encoding extension so this covers the combined
+    // alignment path seen in GaussDB-compatible servers.
+    public async Task Exporter_reads_trailer_from_same_copy_data_message()
+    {
+        await using var postmasterMock = PgPostmasterMock.Start(ConnectionString);
+        await using var dataSource = CreateDataSource(postmasterMock.ConnectionString);
+        await using var conn = await dataSource.OpenConnectionAsync();
+
+        var server = await postmasterMock.WaitForServerConnection();
+        const string copyCommand = "COPY (SELECT 1::int4) TO STDOUT BINARY";
+        var exportTask = conn.BeginBinaryExportAsync(copyCommand);
+
+        await server.ExpectSimpleQuery(copyCommand);
+        WriteCopyOutResponse(server, numColumns: 1);
+        WriteCopyData(server, Concat(
+            BuildHeaderAndSingleRowPayload(
+                flags: FileHasEncodingFlag,
+                extensionPayload: [0, 7],
+                rowFields: [Int32ToBigEndianBytes(1)]),
+            BuildTrailerPayload()));
+        WriteCopyDone(server);
+        server.WriteCommandComplete("COPY 1");
+        server.WriteReadyForQuery();
+        await server.FlushAsync();
+
+        await using var exporter = await exportTask;
+
+        Assert.That(exporter.StartRow(), Is.EqualTo(1));
+        Assert.That(exporter.Read<int>(), Is.EqualTo(1));
+        Assert.That(exporter.StartRow(), Is.EqualTo(-1));
+    }
+
+    [Test]
+    // Verifies that unsupported OID mode is rejected up front rather than partially reading the stream.
+    public async Task Exporter_throws_on_oid_copy_flags()
+    {
+        await using var postmasterMock = PgPostmasterMock.Start(ConnectionString);
+        await using var dataSource = CreateDataSource(postmasterMock.ConnectionString);
+        await using var conn = await dataSource.OpenConnectionAsync();
+
+        var server = await postmasterMock.WaitForServerConnection();
+        const string copyCommand = "COPY (SELECT 7::int4) TO STDOUT BINARY";
+        var exportTask = conn.BeginBinaryExportAsync(copyCommand);
+
+        await server.ExpectSimpleQuery(copyCommand);
+        WriteCopyOutResponse(server, numColumns: 1);
+        WriteCopyData(server, BuildHeaderOnlyPayload(flags: FileHasOidsFlag, extensionPayload: []));
+        await server.FlushAsync();
+
+        Assert.That(async () => await exportTask, Throws.Exception.TypeOf<NotSupportedException>());
+    }
+
+    [Test]
+    // Verifies that unrecognized COPY flags are rejected before any row decoding begins.
+    public async Task Exporter_throws_on_unknown_copy_flags()
+    {
+        await using var postmasterMock = PgPostmasterMock.Start(ConnectionString);
+        await using var dataSource = CreateDataSource(postmasterMock.ConnectionString);
+        await using var conn = await dataSource.OpenConnectionAsync();
+
+        var server = await postmasterMock.WaitForServerConnection();
+        const string copyCommand = "COPY (SELECT 1::int4) TO STDOUT BINARY";
+        var exportTask = conn.BeginBinaryExportAsync(copyCommand);
+
+        await server.ExpectSimpleQuery(copyCommand);
+        WriteCopyOutResponse(server, numColumns: 1);
+        WriteCopyData(server, BuildHeaderOnlyPayload(flags: 1 << 14, extensionPayload: []));
+        await server.FlushAsync();
+
+        Assert.That(async () => await exportTask, Throws.Exception.TypeOf<NotSupportedException>());
+    }
+
+    [Test]
+    // Real end-to-end compatibility coverage on GaussDB rather than PgServerMock. This validates that
+    // the driver can import and then export multiple rows across normal values, nulls, bytea payloads,
+    // and a large text value while preserving a stable export order.
+    public async Task Binary_roundtrip_no_oids_real_compatibility()
+    {
+        await using var conn = await OpenConnectionAsync();
+        var table = await CreateTempTable(conn, "id INT4, note TEXT, payload BYTEA");
+        var longNote = new string('x', conn.Settings.WriteBufferSize + 50);
+        var payload1 = new byte[] { 1, 2, 3 };
+        var payload3 = new byte[] { 9, 8, 7, 6, 5, 4 };
+
+        await using (var writer = await conn.BeginBinaryImportAsync($"COPY {table} (id, note, payload) FROM STDIN BINARY"))
+        {
+            await writer.StartRowAsync();
+            await writer.WriteAsync(7);
+            await writer.WriteAsync("alpha");
+            await writer.WriteAsync(payload1, GaussDBDbType.Bytea);
+
+            await writer.StartRowAsync();
+            await writer.WriteAsync(8);
+            writer.WriteNull();
+            writer.WriteNull();
+
+            await writer.StartRowAsync();
+            await writer.WriteAsync(9);
+            await writer.WriteAsync(longNote);
+            await writer.WriteAsync(payload3, GaussDBDbType.Bytea);
+
+            Assert.That(await writer.CompleteAsync(), Is.EqualTo(3));
+        }
+
+        Assert.That(await conn.ExecuteScalarAsync($"SELECT COUNT(*) FROM {table}"), Is.EqualTo(3));
+
+        await using var exporter = await conn.BeginBinaryExportAsync($"COPY (SELECT id, note, payload FROM {table} ORDER BY id) TO STDOUT BINARY");
+        Assert.That(await exporter.StartRowAsync(), Is.EqualTo(3));
+        Assert.That(exporter.Read<int>(), Is.EqualTo(7));
+        Assert.That(exporter.Read<string>(), Is.EqualTo("alpha"));
+        Assert.That(exporter.Read<byte[]>(GaussDBDbType.Bytea), Is.EqualTo(payload1));
+
+        Assert.That(await exporter.StartRowAsync(), Is.EqualTo(3));
+        Assert.That(exporter.Read<int>(), Is.EqualTo(8));
+        Assert.That(exporter.IsNull, Is.True);
+        exporter.Skip();
+        Assert.That(exporter.IsNull, Is.True);
+        exporter.Skip();
+
+        Assert.That(await exporter.StartRowAsync(), Is.EqualTo(3));
+        Assert.That(exporter.Read<int>(), Is.EqualTo(9));
+        Assert.That(exporter.Read<string>(), Is.EqualTo(longNote));
+        Assert.That(exporter.Read<byte[]>(GaussDBDbType.Bytea), Is.EqualTo(payload3));
+
+        Assert.That(await exporter.StartRowAsync(), Is.EqualTo(-1));
     }
 
     //[Test, IssueLink("https://github.com/npgsql/npgsql/issues/5457")]
@@ -1383,6 +1549,255 @@ INSERT INTO {table} (field_text, field_int4) VALUES ('HELLO', 1)");
     #endregion
 
     #region Utils
+
+    // Builds a binary COPY header without rows. extensionPayload represents the protocol header extension
+    // area after extLen; for file_has_encoding this is the 2-byte file encoding marker, but tests keep it
+    // opaque because the driver only needs to preserve stream alignment.
+    static byte[] BuildHeaderOnlyPayload(int flags, byte[] extensionPayload)
+    {
+        var payload = new List<byte>(GaussDBRawCopyStream.BinarySignature.Length + 8 + extensionPayload.Length);
+        payload.AddRange(GaussDBRawCopyStream.BinarySignature);
+        AppendInt32BigEndian(payload, flags);
+        AppendInt32BigEndian(payload, extensionPayload.Length);
+        payload.AddRange(extensionPayload);
+        return payload.ToArray();
+    }
+
+    // Builds a header followed by a single row. This lets mock-server tests place a GaussDB encoding
+    // extension before real row data and assert that the first typed read is not shifted by those bytes.
+    static byte[] BuildHeaderAndSingleRowPayload(int flags, byte[] extensionPayload, byte[][] rowFields)
+    {
+        var payload = new List<byte>(GaussDBRawCopyStream.BinarySignature.Length + 8 + extensionPayload.Length + 128);
+        payload.AddRange(GaussDBRawCopyStream.BinarySignature);
+        AppendInt32BigEndian(payload, flags);
+        AppendInt32BigEndian(payload, extensionPayload.Length);
+        payload.AddRange(extensionPayload);
+
+        AppendInt16BigEndian(payload, checked((short)rowFields.Length));
+        foreach (var field in rowFields)
+        {
+            AppendInt32BigEndian(payload, field.Length);
+            payload.AddRange(field);
+        }
+
+        return payload.ToArray();
+    }
+
+    static byte[] BuildTrailerPayload()
+    {
+        var payload = new List<byte>(2);
+        AppendInt16BigEndian(payload, -1);
+        return payload.ToArray();
+    }
+
+    static byte[] Concat(params byte[][] payloads)
+    {
+        var payload = new List<byte>();
+        foreach (var item in payloads)
+            payload.AddRange(item);
+        return payload.ToArray();
+    }
+
+    static (byte[] HeaderAndRowPayload, byte[] TrailerPayload) SplitPayloadAfterFirstRow(byte[] payload)
+    {
+        var offset = GaussDBRawCopyStream.BinarySignature.Length;
+        offset += 4; // flags
+        var extensionLen = ReadInt32BigEndian(payload, offset);
+        offset += 4 + extensionLen;
+
+        var columnCount = ReadInt16BigEndian(payload, offset);
+        offset += 2;
+        for (var i = 0; i < columnCount; i++)
+        {
+            var fieldLength = ReadInt32BigEndian(payload, offset);
+            offset += 4;
+            if (fieldLength != -1)
+                offset += fieldLength;
+        }
+
+        var headerAndRow = new byte[offset];
+        Buffer.BlockCopy(payload, 0, headerAndRow, 0, offset);
+
+        var trailerLength = payload.Length - offset;
+        var trailer = new byte[trailerLength];
+        Buffer.BlockCopy(payload, offset, trailer, 0, trailerLength);
+        return (headerAndRow, trailer);
+    }
+
+    static async Task<byte[]> ReadRequiredCopyDataPayload(PgServerMock server)
+    {
+        List<byte> seenCodes = [];
+        const int maxMessages = 8;
+        for (var i = 0; i < maxMessages; i++)
+        {
+            var (code, payload) = await ReadFrontendMessage(server);
+            seenCodes.Add(code);
+            if (code == (byte)'d')
+                return payload;
+        }
+
+        Assert.Fail($"Expected frontend CopyData within {maxMessages} messages, but saw: {FormatMessageCodes(seenCodes)}");
+        return null!;
+    }
+
+    static async Task ReadUntilCopyDone(PgServerMock server)
+    {
+        List<byte> seenCodes = [];
+        const int maxMessages = 8;
+        for (var i = 0; i < maxMessages; i++)
+        {
+            var (code, _) = await ReadFrontendMessage(server);
+            seenCodes.Add(code);
+            if (code == (byte)'c')
+                return;
+        }
+
+        Assert.Fail($"Expected frontend CopyDone within {maxMessages} messages, but saw: {FormatMessageCodes(seenCodes)}");
+    }
+
+    static async Task<byte[]> ReadAllCopyDataPayloadsUntilCopyDone(PgServerMock server)
+    {
+        var payload = new List<byte>();
+        List<byte> seenCodes = [];
+        const int maxMessages = 16;
+        for (var i = 0; i < maxMessages; i++)
+        {
+            var (code, chunk) = await ReadFrontendMessage(server);
+            seenCodes.Add(code);
+            switch (code)
+            {
+            case (byte)'d':
+                payload.AddRange(chunk);
+                break;
+            case (byte)'c':
+                return payload.ToArray();
+            default:
+                Assert.Fail($"Unexpected frontend message '{FormatMessageCode(code)}' while waiting for CopyDone. Seen: {FormatMessageCodes(seenCodes)}");
+                return null!;
+            }
+        }
+
+        Assert.Fail($"Expected frontend CopyDone within {maxMessages} messages, but saw: {FormatMessageCodes(seenCodes)}");
+        return null!;
+    }
+
+    static async Task<(byte Code, byte[] Payload)> ReadFrontendMessage(PgServerMock server)
+    {
+        var readBuffer = server.ReadBuffer;
+        await readBuffer.EnsureAsync(5);
+        var code = readBuffer.ReadByte();
+        var payloadLength = readBuffer.ReadInt32() - 4;
+
+        var payload = new byte[payloadLength];
+        if (payloadLength > 0)
+        {
+            await readBuffer.EnsureAsync(payloadLength);
+            readBuffer.ReadBytes(payload, 0, payloadLength);
+        }
+
+        return (code, payload);
+    }
+
+    static void WriteCopyOutResponse(PgServerMock server, short numColumns)
+    {
+        var writeBuffer = server.WriteBuffer;
+        writeBuffer.WriteByte((byte)'H');
+        writeBuffer.WriteInt32(4 + 1 + 2 + 2 * numColumns);
+        writeBuffer.WriteByte(1);
+        writeBuffer.WriteInt16(numColumns);
+        for (var i = 0; i < numColumns; i++)
+            writeBuffer.WriteInt16(1);
+    }
+
+    static void WriteCopyData(PgServerMock server, byte[] payload)
+    {
+        var writeBuffer = server.WriteBuffer;
+        writeBuffer.WriteByte((byte)'d');
+        writeBuffer.WriteInt32(4 + payload.Length);
+        writeBuffer.WriteBytes(payload);
+    }
+
+    static void WriteCopyDone(PgServerMock server)
+    {
+        var writeBuffer = server.WriteBuffer;
+        writeBuffer.WriteByte((byte)'c');
+        writeBuffer.WriteInt32(4);
+    }
+
+    static void AssertBinaryCopyHeader(byte[] payload, int expectedFlags)
+    {
+        Assert.That(payload.AsSpan(0, GaussDBRawCopyStream.BinarySignature.Length).ToArray(),
+            Is.EqualTo(GaussDBRawCopyStream.BinarySignature));
+        Assert.That(ReadInt32BigEndian(payload, GaussDBRawCopyStream.BinarySignature.Length), Is.EqualTo(expectedFlags));
+    }
+
+    static void AssertBinaryCopyFirstRow(byte[] payload, short expectedColumnCount, uint expectedFirstFieldAsUInt32, int expectedSecondFieldAsInt32)
+    {
+        var offset = GaussDBRawCopyStream.BinarySignature.Length;
+        offset += 4; // flags
+        var extensionLen = ReadInt32BigEndian(payload, offset);
+        offset += 4 + extensionLen;
+
+        Assert.That(ReadInt16BigEndian(payload, offset), Is.EqualTo(expectedColumnCount));
+        offset += 2;
+
+        Assert.That(ReadInt32BigEndian(payload, offset), Is.EqualTo(4));
+        offset += 4;
+        Assert.That(ReadUInt32BigEndian(payload, offset), Is.EqualTo(expectedFirstFieldAsUInt32));
+        offset += 4;
+
+        Assert.That(ReadInt32BigEndian(payload, offset), Is.EqualTo(4));
+        offset += 4;
+        Assert.That(ReadInt32BigEndian(payload, offset), Is.EqualTo(expectedSecondFieldAsInt32));
+    }
+
+    static byte[] Int32ToBigEndianBytes(int value)
+    {
+        var bytes = new byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+        return bytes;
+    }
+
+    static byte[] UInt32ToBigEndianBytes(uint value)
+    {
+        var bytes = new byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(bytes, value);
+        return bytes;
+    }
+
+    static void AppendInt16BigEndian(List<byte> payload, short value)
+    {
+        var bytes = new byte[2];
+        BinaryPrimitives.WriteInt16BigEndian(bytes, value);
+        payload.AddRange(bytes);
+    }
+
+    static void AppendInt32BigEndian(List<byte> payload, int value)
+    {
+        var bytes = new byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+        payload.AddRange(bytes);
+    }
+
+    static short ReadInt16BigEndian(byte[] payload, int offset)
+        => BinaryPrimitives.ReadInt16BigEndian(payload.AsSpan(offset, 2));
+
+    static int ReadInt32BigEndian(byte[] payload, int offset)
+        => BinaryPrimitives.ReadInt32BigEndian(payload.AsSpan(offset, 4));
+
+    static uint ReadUInt32BigEndian(byte[] payload, int offset)
+        => BinaryPrimitives.ReadUInt32BigEndian(payload.AsSpan(offset, 4));
+
+    static string FormatMessageCodes(IEnumerable<byte> codes)
+    {
+        var formattedCodes = new List<string>();
+        foreach (var code in codes)
+            formattedCodes.Add(FormatMessageCode(code));
+        return string.Join(", ", formattedCodes);
+    }
+
+    static string FormatMessageCode(byte code)
+        => $"{(char)code} (0x{code:X2})";
 
     /// <summary>
     /// Checks that the connector state is properly managed for COPY operations

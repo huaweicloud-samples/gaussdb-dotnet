@@ -19,6 +19,13 @@ public sealed class GaussDBBinaryExporter : ICancelable
 {
     const int BeforeRow = -2;
     const int BeforeColumn = -1;
+    // Binary COPY ends its file-format payload with Int16 -1 before the protocol-level CopyDone.
+    const short BinaryCopyTrailer = -1;
+    // GaussDB/openGauss may set file_has_encoding and place a 2-byte encoding marker in the header
+    // extension area. The driver does not interpret that value; it only consumes the declared bytes
+    // so row decoding remains aligned with the first real field.
+    const int FileHasEncodingFlag = 1 << 15;
+    const int SupportedCopyFlags = FileHasEncodingFlag;
 
     #region Fields and Properties
 
@@ -28,6 +35,9 @@ public sealed class GaussDBBinaryExporter : ICancelable
     long _endOfMessagePos;
 
     short _column;
+    // The actual number of columns in the current row payload. Some servers emit the last row and the
+    // binary trailer inside a single CopyData message, so this must be tracked independently from NumColumns.
+    int _currentRowColumnCount;
     ulong _rowsExported;
 
     PgReader PgReader => _buf.PgReader;
@@ -58,6 +68,7 @@ public sealed class GaussDBBinaryExporter : ICancelable
         _connector = connector;
         _buf = connector.ReadBuffer;
         _column = BeforeRow;
+        _currentRowColumnCount = 0;
         _columnInfoCache = null!;
         _copyLogger = connector.LoggingConfiguration.CopyLogger;
     }
@@ -109,12 +120,20 @@ public sealed class GaussDBBinaryExporter : ICancelable
             if (_buf.ReadByte() != t)
                 throw new GaussDBException("Invalid COPY binary signature at beginning!");
 
-        //todo: GaussDB无OID列
-        /*var flags = _buf.ReadInt32();
-        if (flags != 0)
-            throw new NotSupportedException("Unsupported flags in COPY operation (OID inclusion?)");*/
+        var flags = _buf.ReadInt32();
+        if ((flags & ~SupportedCopyFlags) != 0)
+            throw new NotSupportedException("Unsupported flags in COPY operation");
 
-        _buf.ReadInt32();   // Header extensions, currently unused
+        var headerExtensionLength = _buf.ReadInt32();
+        if (headerExtensionLength < 0)
+            throw new GaussDBException("Invalid COPY binary header extension length");
+        if (headerExtensionLength > 0)
+        {
+            // The extension payload can carry server-specific metadata, including the 2-byte file
+            // encoding marker associated with file_has_encoding. We treat it as opaque and skip it.
+            await _buf.Ensure(headerExtensionLength, async).ConfigureAwait(false);
+            _buf.Skip(headerExtensionLength);
+        }
     }
 
     #endregion
@@ -157,25 +176,43 @@ public sealed class GaussDBBinaryExporter : ICancelable
             _column++;
         }
 
-        // The very first row (i.e. _column == -1) is included in the header's CopyData message.
-        // Otherwise we need to read in a new CopyData row (the docs specify that there's a CopyData
-        // message per row).
-        if (_column == NumColumns)
+        // The first row can begin in the header CopyData, and the last row can share a CopyData message
+        // with the binary trailer. Only read the next backend message after the current payload is fully
+        // consumed; otherwise a trailing CopyDone can be mistaken for a row payload boundary.
+        var atRowBoundary = _column == BeforeRow || _column == _currentRowColumnCount;
+        if (atRowBoundary && _buf.CumulativeReadPosition == _endOfMessagePos)
         {
-            var msg = Expect<CopyDataMessage>(await _connector.ReadMessage(async).ConfigureAwait(false), _connector);
-            _endOfMessagePos = _buf.CumulativeReadPosition + msg.Length;
+            var msg = await _connector.ReadMessage(async).ConfigureAwait(false);
+            switch (msg.Code)
+            {
+            case BackendMessageCode.CopyData:
+                _endOfMessagePos = _buf.CumulativeReadPosition + ((CopyDataMessage)msg).Length;
+                break;
+            case BackendMessageCode.CopyDone:
+                // PostgreSQL binary COPY normally ends with an Int16 -1 trailer inside the last CopyData
+                // payload. Some GaussDB/openGauss paths skip that file-format trailer and go straight to
+                // protocol-level CopyDone after the last row, so accept CopyDone only when we are already
+                // at a row boundary.
+                await ConsumeCopyCompletionMessages(async).ConfigureAwait(false);
+                _column = BeforeRow;
+                _isConsumed = true;
+                return -1;
+            default:
+                throw _connector.UnexpectedMessageReceived(msg.Code);
+            }
         }
-        else if (_column != BeforeRow)
+        else if (!atRowBoundary)
             ThrowHelper.ThrowInvalidOperationException("Already in the middle of a row");
 
         await _buf.Ensure(2, async).ConfigureAwait(false);
 
         var numColumns = _buf.ReadInt16();
-        if (numColumns == -1)
+        // In the binary COPY file format, the per-row column count is Int16 -1 for EOF, and the server
+        // still follows it with the protocol-level CopyDone message.
+        if (numColumns == BinaryCopyTrailer)
         {
             Expect<CopyDoneMessage>(await _connector.ReadMessage(async).ConfigureAwait(false), _connector);
-            Expect<CommandCompleteMessage>(await _connector.ReadMessage(async).ConfigureAwait(false), _connector);
-            Expect<ReadyForQueryMessage>(await _connector.ReadMessage(async).ConfigureAwait(false), _connector);
+            await ConsumeCopyCompletionMessages(async).ConfigureAwait(false);
             _column = BeforeRow;
             _isConsumed = true;
             return -1;
@@ -184,8 +221,15 @@ public sealed class GaussDBBinaryExporter : ICancelable
         //Debug.Assert(numColumns == NumColumns);
 
         _column = BeforeColumn;
+        _currentRowColumnCount = numColumns;
         _rowsExported++;
-        return NumColumns;
+        return numColumns;
+    }
+
+    async Task ConsumeCopyCompletionMessages(bool async)
+    {
+        Expect<CommandCompleteMessage>(await _connector.ReadMessage(async).ConfigureAwait(false), _connector);
+        Expect<ReadyForQueryMessage>(await _connector.ReadMessage(async).ConfigureAwait(false), _connector);
     }
 
     /// <summary>
@@ -409,7 +453,7 @@ public sealed class GaussDBBinaryExporter : ICancelable
     {
         PgReader.Commit();
 
-        if (_column + 1 == NumColumns)
+        if (_column + 1 == _currentRowColumnCount)
             ThrowHelper.ThrowInvalidOperationException("No more columns left in the current row");
         _column++;
         _buf.Ensure(sizeof(int));
@@ -421,7 +465,7 @@ public sealed class GaussDBBinaryExporter : ICancelable
     {
         await PgReader.CommitAsync().ConfigureAwait(false);
 
-        if (_column + 1 == NumColumns)
+        if (_column + 1 == _currentRowColumnCount)
             ThrowHelper.ThrowInvalidOperationException("No more columns left in the current row");
         _column++;
         await _buf.Ensure(sizeof(int), async: true).ConfigureAwait(false);
