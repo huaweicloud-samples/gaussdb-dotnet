@@ -61,7 +61,10 @@ args:
 
 var solutionPath = "./GaussDB.slnx";
 string[] srcProjects = [
-    "./src/GaussDB/GaussDB.csproj"
+    "./src/GaussDB/GaussDB.csproj",
+    "./src/GaussDB.NodaTime/GaussDB.NodaTime.csproj",
+    "./src/GaussDB.NetTopologySuite/GaussDB.NetTopologySuite.csproj",
+    "./src/GaussDB.DependencyInjection/GaussDB.DependencyInjection.csproj"
 ];
 string[] testProjects = [
     "./test/GaussDB.Tests/GaussDB.Tests.csproj",
