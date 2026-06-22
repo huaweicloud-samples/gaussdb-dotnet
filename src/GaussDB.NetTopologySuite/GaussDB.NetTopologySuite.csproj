@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <IsPackable>false</IsPackable>
+    <IsPackable>true</IsPackable>
+    <PackageId>HuaweiCloud.GaussDB.Driver.NetTopologySuite</PackageId>
     <Description>NetTopologySuite plugin for GaussDB, allowing mapping of PostGIS geometry types to NetTopologySuite types.</Description>
     <PackageTags>$(PackageTags);postgis;spatial;nettopologysuite;nts;</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>

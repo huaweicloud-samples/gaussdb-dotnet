@@ -1,7 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <IsPackable>false</IsPackable>
+        <IsPackable>true</IsPackable>
+        <PackageId>HuaweiCloud.GaussDB.Driver.DependencyInjection</PackageId>
         <TargetFramework>net8.0</TargetFramework>
         <PackageTags>$(PackageTags);di;dependency injection</PackageTags>
         <PackageReadmeFile>README.md</PackageReadmeFile>

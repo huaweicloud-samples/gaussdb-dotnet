@@ -7,10 +7,8 @@
     <Authors>HuaweiCloud</Authors>
     <Company>Huawei Cloud</Company>
     <NamespacePrefix>HuaweiCloud.</NamespacePrefix>
-    <PackagePrefix>HuaweiCloud.Driver.</PackagePrefix>
-    <AssemblyName>$(PackagePrefix)$(MSBuildProjectName)</AssemblyName>
+    <AssemblyName>HuaweiCloud.Driver.$(MSBuildProjectName)</AssemblyName>
     <RootNamespace>$(NamespacePrefix)$(MSBuildProjectName)</RootNamespace>
-    <PackageId>HuaweiCloud.Driver.$(MSBuildProjectName)</PackageId>
     <PackageTags>gaussdb;openguass;ado;ado.net;database;sql</PackageTags>
   </PropertyGroup>
 

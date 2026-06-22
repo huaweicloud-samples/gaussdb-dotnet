@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <IsPackable>false</IsPackable>
+    <IsPackable>true</IsPackable>
+    <PackageId>HuaweiCloud.GaussDB.Driver.NodaTime</PackageId>
     <Description>NodaTime plugin for GaussDB, allowing mapping of PostgreSQL date/time types to NodaTime types.</Description>
     <PackageTags>$(PackageTags);nodatime;date;time;</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>

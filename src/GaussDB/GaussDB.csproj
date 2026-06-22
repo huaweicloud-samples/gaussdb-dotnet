@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
+    <PackageId>HuaweiCloud.GaussDB.Driver</PackageId>
     <Description>GaussDB is the open source .NET data provider for GaussDB/OpenGauss.</Description>
     <PackageTags>$(PackageTags)</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
